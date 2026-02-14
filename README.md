@@ -1,8 +1,8 @@
-# CRAFT Platform
+## CRAFT
 
 A no-code platform for deploying customized DeFi applications on the Stellar blockchain.
 
-## Project Structure
+### Project Structure
 
 ```
 craft-platform/
