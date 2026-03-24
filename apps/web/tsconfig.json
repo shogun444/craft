@@ -1,6 +1,7 @@
 {
-    "extends": "@craft/config/tsconfig.json",
+    "extends": "../../packages/config/tsconfig.json",
     "compilerOptions": {
+        "types": ["vitest/globals"],
         "paths": {
             "@/*": [
                 "./src/*"
