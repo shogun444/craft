@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { withAuth } from '@/lib/api/with-auth';
 import { paymentService } from '@/services/payment.service';
+import { getValidPriceIds } from '@/lib/stripe/pricing';
 
 const checkoutSchema = z.object({
     priceId: z.string().min(1),
@@ -23,6 +24,13 @@ export const POST = withAuth(async (req: NextRequest, { user }) => {
             { error: 'Invalid input', details: parsed.error.flatten().fieldErrors },
             { status: 400 }
         );
+    }
+
+    // Reject price IDs that are not mapped to a known tier.
+    // This prevents callers from passing arbitrary Stripe price IDs.
+    const validIds = getValidPriceIds();
+    if (!validIds.includes(priceId)) {
+        return NextResponse.json({ error: 'Invalid price ID' }, { status: 400 });
     }
 
     try {
