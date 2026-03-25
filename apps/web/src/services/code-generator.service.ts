@@ -62,6 +62,7 @@ export class CodeGeneratorService {
                 this.generateEnvFile(templateFamily, customization),
                 this.generateEnvExample(templateFamily, customization),
                 this.generatePackageJson(templateFamily, customization),
+                this.generateFeatureFlagsFile(templateFamily, customization),
                 ...this.generateFamilySpecificFiles(templateFamily, customization),
             ];
 
@@ -124,6 +125,16 @@ export default config;
 
     generateEnvExample(family: TemplateFamilyId, cfg: CustomizationConfig): GeneratedFile {
         return { path: '.env.example', content: renderEnvExample(family, cfg), type: 'config' };
+    }
+
+    // ── Feature flags file ────────────────────────────────────────────────────
+
+    generateFeatureFlagsFile(family: TemplateFamilyId, cfg: CustomizationConfig): GeneratedFile {
+        return {
+            path: 'src/lib/feature-flags.ts',
+            content: generateFeatureFlagsFile(family, cfg.features),
+            type: 'config',
+        };
     }
 
     // ── package.json ──────────────────────────────────────────────────────────
