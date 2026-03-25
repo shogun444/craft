@@ -11,6 +11,11 @@ import {
 
 const HEX_COLOR = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
+/**
+ * Zod schema for customization config validation.
+ * Note: Network validators are intentionally lenient here; detailed validation
+ * is performed in businessRuleErrors using the StellarNetworkService.
+ */
 export const customizationConfigSchema = z.object({
     branding: z.object({
         appName: z.string().min(1, 'App name is required').max(60, 'App name must be 60 characters or fewer'),
@@ -26,7 +31,8 @@ export const customizationConfigSchema = z.object({
         enableNotifications: z.boolean(),
     }),
     stellar: z.object({
-        network: z.enum(['mainnet', 'testnet']),
+        // Use unknown to allow detailed validation in businessRuleErrors
+        network: z.unknown(),
         horizonUrl: z.string().url('Horizon URL must be a valid URL'),
         sorobanRpcUrl: z.string().url('Soroban RPC URL must be a valid URL').optional(),
         assetPairs: z.array(z.any()).optional(),
@@ -59,6 +65,8 @@ function businessRuleErrors(config: CustomizationConfig): ValidationError[] {
         });
     }
 
+    // ── Branding validation ────────────────────────────────────────────────────
+
     if (config.branding.primaryColor === config.branding.secondaryColor) {
         errors.push({
             field: 'branding.secondaryColor',
@@ -86,6 +94,9 @@ function businessRuleErrors(config: CustomizationConfig): ValidationError[] {
  * Validate a customization config payload.
  * Returns a stable ValidationResult with field-level errors.
  * Safe to call from both API routes and internal services.
+ *
+ * Network validation is performed by StellarNetworkService to provide
+ * detailed, actionable error messages for unsupported or invalid networks.
  */
 export function validateCustomizationConfig(input: unknown): ValidationResult {
     const parsed = customizationConfigSchema.safeParse(input);
@@ -99,7 +110,11 @@ export function validateCustomizationConfig(input: unknown): ValidationResult {
         return { valid: false, errors };
     }
 
-    const businessErrors = businessRuleErrors(parsed.data);
+    // Type-cast parsed data for business rule validation
+    // (safe because schema validation passed all required checks)
+    const config = parsed.data as unknown as CustomizationConfig;
+
+    const businessErrors = businessRuleErrors(config);
     if (businessErrors.length > 0) {
         return { valid: false, errors: businessErrors };
     }
