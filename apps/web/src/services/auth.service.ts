@@ -59,6 +59,7 @@ export class AuthService {
                 createdAt: new Date(data.user.created_at),
                 subscriptionTier: 'free',
                 githubConnected: false,
+                githubUsername: null,
             },
             session: data.session
                 ? {
@@ -107,7 +108,7 @@ export class AuthService {
         // Get profile data
         const { data: profile } = await supabase
             .from('profiles')
-            .select('subscription_tier, github_connected')
+            .select('subscription_tier, github_connected, github_username')
             .eq('id', data.user.id)
             .single();
 
@@ -118,6 +119,7 @@ export class AuthService {
                 createdAt: new Date(data.user.created_at),
                 subscriptionTier: profile?.subscription_tier || 'free',
                 githubConnected: profile?.github_connected || false,
+                githubUsername: profile?.github_username ?? null,
             },
             session: data.session
                 ? {
@@ -155,7 +157,7 @@ export class AuthService {
         // Get profile data
         const { data: profile } = await supabase
             .from('profiles')
-            .select('subscription_tier, github_connected')
+            .select('subscription_tier, github_connected, github_username')
             .eq('id', user.id)
             .single();
 
@@ -165,6 +167,7 @@ export class AuthService {
             createdAt: new Date(user.created_at),
             subscriptionTier: profile?.subscription_tier || 'free',
             githubConnected: profile?.github_connected || false,
+            githubUsername: profile?.github_username ?? null,
         };
     }
 
@@ -195,7 +198,7 @@ export class AuthService {
         // Get profile data
         const { data: profile } = await supabase
             .from('profiles')
-            .select('subscription_tier, github_connected')
+            .select('subscription_tier, github_connected, github_username')
             .eq('id', userId)
             .single();
 
@@ -205,6 +208,7 @@ export class AuthService {
             createdAt: new Date(user.user.created_at),
             subscriptionTier: profile?.subscription_tier || 'free',
             githubConnected: profile?.github_connected || false,
+            githubUsername: profile?.github_username ?? null,
         };
     }
 
