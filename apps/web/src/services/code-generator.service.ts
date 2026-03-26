@@ -57,15 +57,17 @@ export class CodeGeneratorService {
         const { templateFamily, customization } = request;
 
         try {
-            const files: GeneratedFile[] = [
+            // Always include these files for every template family
+            const baseFiles: GeneratedFile[] = [
                 this.generateConfigFile(templateFamily, customization),
                 this.generateEnvFile(templateFamily, customization),
                 this.generateEnvExample(templateFamily, customization),
                 this.generatePackageJson(templateFamily, customization),
                 this.generateFeatureFlagsFile(templateFamily, customization),
-                ...this.generateFamilySpecificFiles(templateFamily, customization),
             ];
-
+            // Add family-specific files
+            const familyFiles = this.generateFamilySpecificFiles(templateFamily, customization);
+            const files = [...baseFiles, ...familyFiles];
             return { success: true, generatedFiles: files, errors: [] };
         } catch (err: any) {
             return {

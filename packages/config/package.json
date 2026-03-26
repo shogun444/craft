@@ -6,5 +6,8 @@
     "files": [
         "eslint-preset.js",
         "tsconfig.json"
-    ]
+    ],
+    "scripts": {
+        "lint": "eslint eslint-preset.js"
+    }
 }
