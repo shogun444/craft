@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { withAuth } from '@/lib/api/with-auth';
+import { getEntitlements } from '@/lib/stripe/pricing';
+import type { SubscriptionTier } from '@craft/types';
 import {
   validateCustomizationConfig,
   validateStellarEndpoints,
@@ -52,6 +54,34 @@ export const POST = withAuth(async (req: NextRequest, { supabase, user }) => {
 
   if (tplErr || !template) {
     return NextResponse.json({ error: 'Template not found' }, { status: 404 });
+  }
+
+  // Enforce deployment count limit based on subscription tier
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('subscription_tier')
+    .eq('id', user.id)
+    .single();
+
+  const tier = ((profile?.subscription_tier as SubscriptionTier) ?? 'free');
+  const { maxDeployments } = getEntitlements(tier);
+
+  if (maxDeployments !== -1) {
+    const { count } = await supabase
+      .from('deployments')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .eq('is_active', true);
+
+    if ((count ?? 0) >= maxDeployments) {
+      return NextResponse.json(
+        {
+          error: `Deployment limit reached. Your ${tier} plan allows ${maxDeployments} active deployment${maxDeployments !== 1 ? 's' : ''}.`,
+          upgradeUrl: '/pricing',
+        },
+        { status: 403 }
+      );
+    }
   }
 
   const customization = body.customizationConfig ?? {};
