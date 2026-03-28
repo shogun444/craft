@@ -202,6 +202,35 @@ export interface Database {
                     updated_at?: string;
                 };
             };
+            error_reports: {
+                Row: {
+                    id: string;
+                    user_id: string;
+                    correlation_id: string | null;
+                    description: string;
+                    error_context: Json;
+                    status: 'open' | 'investigating' | 'resolved';
+                    created_at: string;
+                };
+                Insert: {
+                    id?: string;
+                    user_id: string;
+                    correlation_id?: string | null;
+                    description: string;
+                    error_context: Json;
+                    status?: 'open' | 'investigating' | 'resolved';
+                    created_at?: string;
+                };
+                Update: {
+                    id?: string;
+                    user_id?: string;
+                    correlation_id?: string | null;
+                    description?: string;
+                    error_context?: Json;
+                    status?: 'open' | 'investigating' | 'resolved';
+                    created_at?: string;
+                };
+            };
             deployment_analytics: {
                 Row: {
                     id: string;
