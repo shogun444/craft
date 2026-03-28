@@ -721,6 +721,28 @@ export class VercelService {
     }
 
     /**
+     * List all domains attached to a Vercel project.
+     *
+     * @param projectId - Vercel project ID
+     * @returns Array of domain configs for the project
+     */
+    async listDomains(projectId: string): Promise<DomainConfig[]> {
+        const data = await this.request<{ domains: Array<Record<string, unknown>> }>(
+            `/v9/projects/${projectId}/domains`,
+            { method: 'GET' },
+        );
+
+        return (data.domains ?? []).map((d) => ({
+            name: d.name as string,
+            verified: d.verified as boolean,
+            forceHttps: (d.forceHttps ?? false) as boolean,
+            redirect: (d.redirect ?? false) as boolean,
+            projectId: d.projectId as string | undefined,
+            deploymentId: d.deploymentId as string | undefined,
+        }));
+    }
+
+    /**
      * Verify domain ownership by checking DNS records.
      *
      * @param domain - Domain name to verify
