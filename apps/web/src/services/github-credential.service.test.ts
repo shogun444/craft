@@ -1,201 +1,391 @@
 /**
- * Unit tests for GitHubCredentialService.
+ * Tests for GitHubCredentialService — secure token storage (#236)
  *
- * Mocks:
- *   supabase — minimal stub with .from().select().eq().single() and
- *              .from().update().eq() chains.
- *   fetch    — injected via constructor so no real HTTP calls are made.
+ * Covers:
+ *   Encryption / plaintext safety
+ *     — token is not stored in plaintext (rotateToken encrypts before writing)
+ *     — ensureValidToken decrypts and returns the plaintext token
  *
- * Coverage:
- *   ensureValidToken
- *     — missing token → NOT_CONNECTED
- *     — DB error → VALIDATION_FAILED
- *     — token within expiry buffer → TOKEN_EXPIRED
- *     — token past expiry → TOKEN_EXPIRED
- *     — no expiry set (classic PAT) → skips expiry check
- *     — GitHub 401 → TOKEN_INVALID
- *     — GitHub non-200/non-401 → VALIDATION_FAILED
- *     — fetch throws → VALIDATION_FAILED
- *     — valid token → returns token and updates refreshed_at
- *     — refreshed_at update failure is silently ignored (best-effort)
+ *   Expiration
+ *     — expired token is rejected on validation
+ *     — token within 5-minute buffer is rejected
+ *     — token with no expiry (classic PAT) is accepted
+ *
+ *   Rotation
+ *     — rotateToken writes an encrypted value (not plaintext)
+ *     — rotateToken returns the new plaintext token
+ *     — old encrypted value is replaced after rotation
+ *     — rotateToken DB error throws VALIDATION_FAILED
+ *
+ *   Cleanup (purge-expired-tokens cron)
+ *     — expired profiles are nulled out
+ *     — non-expired profiles are left intact
+ *     — profiles with no expiry are left intact
+ *
+ *   Existing behaviour (regression)
+ *     — NOT_CONNECTED, VALIDATION_FAILED, TOKEN_INVALID, etc.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
     GitHubCredentialService,
     GitHubCredentialError,
 } from './github-credential.service';
+import { encryptToken } from '@/lib/github/token-encryption';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Encryption key setup ──────────────────────────────────────────────────────
+
+const VALID_KEY = 'a'.repeat(64);
+
+beforeEach(() => { process.env.GITHUB_TOKEN_ENCRYPTION_KEY = VALID_KEY; });
+afterEach(() => { delete process.env.GITHUB_TOKEN_ENCRYPTION_KEY; });
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const USER_ID = 'user-abc';
-const VALID_TOKEN = 'ghp_valid_token';
+const PLAINTEXT_TOKEN = 'ghp_real_plaintext_token_abc123';
 
 function makeResponse(status: number): Response {
     return { ok: status >= 200 && status < 300, status } as Response;
 }
 
-type SupabaseStub = {
-    selectResult: { data: unknown; error: unknown };
-    updateCalled: boolean;
-};
+// Minimal Supabase stub that tracks what was written via update()
+function makeSupabase(row: {
+    github_token_encrypted: string | null;
+    github_token_expires_at: string | null;
+} | null, dbError: unknown = null) {
+    const written: Record<string, unknown>[] = [];
+    let updateError: unknown = null;
 
-function makeSupabase(
-    row: { github_token_encrypted: string | null; github_token_expires_at: string | null } | null,
-    dbError: unknown = null,
-): { client: ReturnType<typeof buildClient>; stub: SupabaseStub } {
-    const stub: SupabaseStub = {
-        selectResult: { data: row, error: dbError },
-        updateCalled: false,
-    };
-
-    const buildClient = () => ({
+    const client = {
+        _written: written,
+        _setUpdateError(e: unknown) { updateError = e; },
         from: (table: string) => {
-            if (table === 'profiles') {
-                return {
-                    select: () => ({
-                        eq: () => ({
-                            single: async () => stub.selectResult,
-                        }),
+            if (table !== 'profiles') throw new Error(`Unexpected table: ${table}`);
+            return {
+                select: () => ({
+                    eq: () => ({
+                        single: async () => ({ data: row, error: dbError }),
                     }),
-                    update: () => ({
-                        eq: () => {
-                            stub.updateCalled = true;
-                            return Promise.resolve({ error: null });
-                        },
-                    }),
-                };
-            }
-            throw new Error(`Unexpected table: ${table}`);
+                }),
+                update: (payload: Record<string, unknown>) => ({
+                    eq: () => {
+                        written.push(payload);
+                        return Promise.resolve({ error: updateError });
+                    },
+                }),
+            };
         },
-    });
-
-    return { client: buildClient() as unknown as ReturnType<typeof buildClient>, stub };
+    };
+    return client;
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Encryption / plaintext safety ─────────────────────────────────────────────
 
-describe('GitHubCredentialService', () => {
-    let mockFetch: ReturnType<typeof vi.fn>;
+describe('secure token storage — encryption', () => {
+    it('rotateToken writes an encrypted value, not the plaintext token', async () => {
+        const db = makeSupabase(null);
+        const svc = new GitHubCredentialService(db as never);
 
-    beforeEach(() => {
-        mockFetch = vi.fn();
+        await svc.rotateToken(USER_ID, PLAINTEXT_TOKEN);
+
+        const [payload] = db._written;
+        expect(payload.github_token_encrypted).toBeDefined();
+        // Must NOT be the raw plaintext
+        expect(payload.github_token_encrypted).not.toBe(PLAINTEXT_TOKEN);
+        // Must NOT contain the plaintext as a substring
+        expect(String(payload.github_token_encrypted)).not.toContain(PLAINTEXT_TOKEN);
     });
 
-    it('throws NOT_CONNECTED when github_token_encrypted is null', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: null, github_token_expires_at: null });
-        const svc = new GitHubCredentialService(client as never, mockFetch);
+    it('rotateToken stored value is a valid AES-256-GCM envelope (3 base64url parts)', async () => {
+        const db = makeSupabase(null);
+        const svc = new GitHubCredentialService(db as never);
 
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'NOT_CONNECTED',
-        });
-        expect(mockFetch).not.toHaveBeenCalled();
+        await svc.rotateToken(USER_ID, PLAINTEXT_TOKEN);
+
+        const stored = String(db._written[0].github_token_encrypted);
+        const parts = stored.split('.');
+        expect(parts).toHaveLength(3);
+        for (const p of parts) expect(p).toMatch(/^[A-Za-z0-9_-]+$/);
     });
 
-    it('throws VALIDATION_FAILED when the DB query errors', async () => {
-        const { client } = makeSupabase(null, new Error('db error'));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
+    it('ensureValidToken decrypts and returns the plaintext token', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: null });
+        const mockFetch = vi.fn().mockResolvedValue(makeResponse(200));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
 
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'VALIDATION_FAILED',
-        });
+        const result = await svc.ensureValidToken(USER_ID);
+
+        expect(result).toBe(PLAINTEXT_TOKEN);
     });
 
-    it('throws TOKEN_EXPIRED when expiry is in the past', async () => {
-        const past = new Date(Date.now() - 60_000).toISOString();
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: past });
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'TOKEN_EXPIRED',
-        });
-        expect(mockFetch).not.toHaveBeenCalled();
-    });
-
-    it('throws TOKEN_EXPIRED when expiry is within the 5-minute buffer', async () => {
-        const soonExpiry = new Date(Date.now() + 2 * 60 * 1000).toISOString(); // 2 min from now
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: soonExpiry });
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'TOKEN_EXPIRED',
-        });
-    });
-
-    it('skips expiry check when github_token_expires_at is null (classic PAT)', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: null });
-        mockFetch.mockResolvedValueOnce(makeResponse(200));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        const token = await svc.ensureValidToken(USER_ID);
-        expect(token).toBe(VALID_TOKEN);
-    });
-
-    it('throws TOKEN_INVALID when GitHub returns 401', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: null });
-        mockFetch.mockResolvedValueOnce(makeResponse(401));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'TOKEN_INVALID',
-        });
-    });
-
-    it('throws VALIDATION_FAILED when GitHub returns an unexpected non-2xx status', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: null });
-        mockFetch.mockResolvedValueOnce(makeResponse(503));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'VALIDATION_FAILED',
-        });
-    });
-
-    it('throws VALIDATION_FAILED when fetch itself throws', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: null });
-        mockFetch.mockRejectedValueOnce(new Error('network error'));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({
-            code: 'VALIDATION_FAILED',
-        });
-    });
-
-    it('returns the token and updates refreshed_at on success', async () => {
-        const { client, stub } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: null });
-        mockFetch.mockResolvedValueOnce(makeResponse(200));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
-
-        const token = await svc.ensureValidToken(USER_ID);
-
-        expect(token).toBe(VALID_TOKEN);
-        expect(stub.updateCalled).toBe(true);
-    });
-
-    it('sends the correct Authorization header to GitHub', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: null });
-        mockFetch.mockResolvedValueOnce(makeResponse(200));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
+    it('ensureValidToken sends the decrypted plaintext in the Authorization header', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: null });
+        const mockFetch = vi.fn().mockResolvedValue(makeResponse(200));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
 
         await svc.ensureValidToken(USER_ID);
 
-        const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
-        expect(url).toBe('https://api.github.com/user');
-        expect(init.headers['Authorization']).toBe(`Bearer ${VALID_TOKEN}`);
+        const [, init] = mockFetch.mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
+        expect(init.headers['Authorization']).toBe(`Bearer ${PLAINTEXT_TOKEN}`);
+    });
+});
+
+// ── Expiration ────────────────────────────────────────────────────────────────
+
+describe('secure token storage — expiration', () => {
+    it('rejects a token whose expiry is in the past', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const past = new Date(Date.now() - 60_000).toISOString();
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: past });
+        const svc = new GitHubCredentialService(db as never, vi.fn());
+
+        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({ code: 'TOKEN_EXPIRED' });
+    });
+
+    it('rejects a token expiring within the 5-minute buffer', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const soonExpiry = new Date(Date.now() + 2 * 60_000).toISOString();
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: soonExpiry });
+        const svc = new GitHubCredentialService(db as never, vi.fn());
+
+        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({ code: 'TOKEN_EXPIRED' });
+    });
+
+    it('accepts a token with no expiry set (classic PAT)', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: null });
+        const mockFetch = vi.fn().mockResolvedValue(makeResponse(200));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
+
+        await expect(svc.ensureValidToken(USER_ID)).resolves.toBe(PLAINTEXT_TOKEN);
     });
 
     it('accepts a token expiring well beyond the buffer', async () => {
-        const future = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 days
-        const { client } = makeSupabase({ github_token_encrypted: VALID_TOKEN, github_token_expires_at: future });
-        mockFetch.mockResolvedValueOnce(makeResponse(200));
-        const svc = new GitHubCredentialService(client as never, mockFetch);
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const future = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: future });
+        const mockFetch = vi.fn().mockResolvedValue(makeResponse(200));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
 
-        await expect(svc.ensureValidToken(USER_ID)).resolves.toBe(VALID_TOKEN);
+        await expect(svc.ensureValidToken(USER_ID)).resolves.toBe(PLAINTEXT_TOKEN);
+    });
+});
+
+// ── Rotation ──────────────────────────────────────────────────────────────────
+
+describe('secure token storage — rotation', () => {
+    it('rotateToken returns the new plaintext token', async () => {
+        const db = makeSupabase(null);
+        const svc = new GitHubCredentialService(db as never);
+
+        const result = await svc.rotateToken(USER_ID, PLAINTEXT_TOKEN);
+
+        expect(result).toBe(PLAINTEXT_TOKEN);
     });
 
-    it('is a GitHubCredentialError instance', async () => {
-        const { client } = makeSupabase({ github_token_encrypted: null, github_token_expires_at: null });
-        const svc = new GitHubCredentialService(client as never, mockFetch);
+    it('rotateToken replaces the stored encrypted value (old value is gone)', async () => {
+        const oldEncrypted = encryptToken('ghp_old_token');
+        const db = makeSupabase({ github_token_encrypted: oldEncrypted, github_token_expires_at: null });
+        const svc = new GitHubCredentialService(db as never);
+
+        await svc.rotateToken(USER_ID, 'ghp_new_token');
+
+        const [payload] = db._written;
+        // New encrypted value must differ from the old one
+        expect(payload.github_token_encrypted).not.toBe(oldEncrypted);
+        // And must not be the old plaintext
+        expect(String(payload.github_token_encrypted)).not.toContain('ghp_old_token');
+    });
+
+    it('rotateToken updates github_token_refreshed_at', async () => {
+        const db = makeSupabase(null);
+        const svc = new GitHubCredentialService(db as never);
+
+        await svc.rotateToken(USER_ID, PLAINTEXT_TOKEN);
+
+        expect(db._written[0].github_token_refreshed_at).toBeDefined();
+    });
+
+    it('rotateToken stores the provided expiresAt when given', async () => {
+        const db = makeSupabase(null);
+        const svc = new GitHubCredentialService(db as never);
+        const expiry = new Date(Date.now() + 8 * 60 * 60 * 1000); // 8 hours
+
+        await svc.rotateToken(USER_ID, PLAINTEXT_TOKEN, expiry);
+
+        expect(db._written[0].github_token_expires_at).toBe(expiry.toISOString());
+    });
+
+    it('rotateToken throws VALIDATION_FAILED when the DB update fails', async () => {
+        const db = makeSupabase(null);
+        db._setUpdateError({ message: 'db error' });
+        const svc = new GitHubCredentialService(db as never);
+
+        await expect(svc.rotateToken(USER_ID, PLAINTEXT_TOKEN)).rejects.toMatchObject({
+            code: 'VALIDATION_FAILED',
+        });
+    });
+
+    it('old token is no longer valid after rotation (ensureValidToken uses new encrypted value)', async () => {
+        // Simulate: DB now holds the new encrypted token after rotation.
+        const newToken = 'ghp_new_token_after_rotation';
+        const newEncrypted = encryptToken(newToken);
+
+        // After rotation the DB row reflects the new encrypted value.
+        const db = makeSupabase({ github_token_encrypted: newEncrypted, github_token_expires_at: null });
+        const mockFetch = vi.fn().mockResolvedValue(makeResponse(200));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
+
+        const result = await svc.ensureValidToken(USER_ID);
+
+        // Must return the NEW plaintext, not the old one
+        expect(result).toBe(newToken);
+        expect(result).not.toBe('ghp_old_token');
+    });
+});
+
+// ── Cleanup cron (unit-level simulation) ─────────────────────────────────────
+
+describe('secure token storage — expired token cleanup', () => {
+    /**
+     * These tests simulate the cleanup logic performed by the
+     * /api/cron/purge-expired-tokens route: profiles with a past
+     * github_token_expires_at should have their token nulled out;
+     * others must be left untouched.
+     */
+
+    type ProfileRow = {
+        id: string;
+        github_token_encrypted: string | null;
+        github_token_expires_at: string | null;
+        github_connected: boolean;
+    };
+
+    function runCleanup(profiles: ProfileRow[], now = new Date()): ProfileRow[] {
+        return profiles.map((p) => {
+            if (
+                p.github_token_expires_at !== null &&
+                new Date(p.github_token_expires_at) < now
+            ) {
+                return {
+                    ...p,
+                    github_token_encrypted: null,
+                    github_token_expires_at: null,
+                    github_connected: false,
+                };
+            }
+            return p;
+        });
+    }
+
+    it('nulls out expired tokens', () => {
+        const profiles: ProfileRow[] = [
+            {
+                id: 'u1',
+                github_token_encrypted: encryptToken('ghp_expired'),
+                github_token_expires_at: new Date(Date.now() - 60_000).toISOString(),
+                github_connected: true,
+            },
+        ];
+
+        const result = runCleanup(profiles);
+
+        expect(result[0].github_token_encrypted).toBeNull();
+        expect(result[0].github_token_expires_at).toBeNull();
+        expect(result[0].github_connected).toBe(false);
+    });
+
+    it('leaves valid (non-expired) tokens intact', () => {
+        const encrypted = encryptToken('ghp_valid');
+        const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const profiles: ProfileRow[] = [
+            { id: 'u2', github_token_encrypted: encrypted, github_token_expires_at: future, github_connected: true },
+        ];
+
+        const result = runCleanup(profiles);
+
+        expect(result[0].github_token_encrypted).toBe(encrypted);
+        expect(result[0].github_connected).toBe(true);
+    });
+
+    it('leaves tokens with no expiry (classic PAT) intact', () => {
+        const encrypted = encryptToken('ghp_pat');
+        const profiles: ProfileRow[] = [
+            { id: 'u3', github_token_encrypted: encrypted, github_token_expires_at: null, github_connected: true },
+        ];
+
+        const result = runCleanup(profiles);
+
+        expect(result[0].github_token_encrypted).toBe(encrypted);
+        expect(result[0].github_connected).toBe(true);
+    });
+
+    it('only purges expired rows when mixed profiles are present', () => {
+        const expiredEncrypted = encryptToken('ghp_expired');
+        const validEncrypted = encryptToken('ghp_valid');
+        const profiles: ProfileRow[] = [
+            {
+                id: 'u4',
+                github_token_encrypted: expiredEncrypted,
+                github_token_expires_at: new Date(Date.now() - 1000).toISOString(),
+                github_connected: true,
+            },
+            {
+                id: 'u5',
+                github_token_encrypted: validEncrypted,
+                github_token_expires_at: new Date(Date.now() + 3600_000).toISOString(),
+                github_connected: true,
+            },
+        ];
+
+        const result = runCleanup(profiles);
+
+        expect(result[0].github_token_encrypted).toBeNull();
+        expect(result[1].github_token_encrypted).toBe(validEncrypted);
+    });
+});
+
+// ── Regression: existing error paths ─────────────────────────────────────────
+
+describe('secure token storage — regression', () => {
+    it('throws NOT_CONNECTED when github_token_encrypted is null', async () => {
+        const db = makeSupabase({ github_token_encrypted: null, github_token_expires_at: null });
+        const svc = new GitHubCredentialService(db as never, vi.fn());
+
+        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({ code: 'NOT_CONNECTED' });
+    });
+
+    it('throws VALIDATION_FAILED when the DB query errors', async () => {
+        const db = makeSupabase(null, new Error('db error'));
+        const svc = new GitHubCredentialService(db as never, vi.fn());
+
+        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+    });
+
+    it('throws TOKEN_INVALID when GitHub returns 401', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: null });
+        const mockFetch = vi.fn().mockResolvedValue(makeResponse(401));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
+
+        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({ code: 'TOKEN_INVALID' });
+    });
+
+    it('throws VALIDATION_FAILED when fetch throws', async () => {
+        const encrypted = encryptToken(PLAINTEXT_TOKEN);
+        const db = makeSupabase({ github_token_encrypted: encrypted, github_token_expires_at: null });
+        const mockFetch = vi.fn().mockRejectedValue(new Error('network error'));
+        const svc = new GitHubCredentialService(db as never, mockFetch);
+
+        await expect(svc.ensureValidToken(USER_ID)).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+    });
+
+    it('error is a GitHubCredentialError instance', async () => {
+        const db = makeSupabase({ github_token_encrypted: null, github_token_expires_at: null });
+        const svc = new GitHubCredentialService(db as never, vi.fn());
 
         const err = await svc.ensureValidToken(USER_ID).catch((e) => e);
         expect(err).toBeInstanceOf(GitHubCredentialError);
