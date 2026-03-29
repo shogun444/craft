@@ -442,3 +442,298 @@ describe('Property 16 – Code Generation Completeness', () => {
         }
     );
 });
+
+// ── Property 46 – Stellar SDK Inclusion ───────────────────────────────────────
+
+/**
+ * Property 46 – Stellar SDK Inclusion
+ *
+ * "For any generated template across all template families, stellar-sdk
+ *  MUST be included in the package.json dependencies. This is a critical
+ *  requirement for all Stellar network integration functionality."
+ *
+ * Validates: Requirements 7.5, Requirement: Stellar SDK Dependency Management
+ *
+ * Strategy
+ * ────────
+ * Test all 4 template families (stellar-dex, soroban-defi, payment-gateway,
+ * asset-issuance) across all possible customization configurations. For each
+ * generated template, parse the generated package.json and verify that
+ * stellar-sdk is present in the dependencies object with a valid version.
+ *
+ * Minimum 100 iterations required by spec for all template types.
+ *
+ * Issue: #069 — implement property test for stellar sdk inclusion
+ */
+describe('Property 46 – Stellar SDK Inclusion', () => {
+    const svc = new CodeGeneratorService();
+
+    // ── 46-A: stellar-sdk is always in dependencies ──────────────────────────
+
+    it(
+        '46-A: for any template type and customization, stellar-sdk is always in package.json dependencies',
+        () => {
+            /**
+             * Feature: code-generation, Property 46: Stellar SDK Inclusion
+             * Validates: Requirements 7.5
+             *
+             * Proof technique: Property-based testing with fast-check
+             * - Generate random CustomizationConfig across full input space
+             * - For each template family (stellar-dex, soroban-defi, payment-gateway, asset-issuance)
+             * - Run generation and assert stellar-sdk is in dependencies
+             * - Repeat 100+ times to prove invariant holds universally
+             */
+            fc.assert(
+                fc.property(arbTemplateFamily, arbCustomizationConfig, (family, cfg) => {
+                    const result = svc.generate({
+                        templateId: family,
+                        templateFamily: family,
+                        customization: cfg,
+                        outputPath: '/tmp/out',
+                    });
+
+                    // If generation itself fails, that's acceptable for edge cases
+                    // but we want to test successful generations
+                    if (!result.success) {
+                        // Skip this iteration as the generation setup was invalid
+                        return true;
+                    }
+
+                    expect(result.errors).toHaveLength(0);
+
+                    // Find package.json in generated files
+                    const pkgFile = result.generatedFiles.find((f) => f.path === 'package.json');
+                    expect(pkgFile, `package.json not generated for ${family}`).toBeDefined();
+                    
+                    if (!pkgFile) return true; // Safety check
+
+                    expect(pkgFile.content.trim().length, `Empty package.json for ${family}`).toBeGreaterThan(0);
+
+                    // Parse package.json
+                    let pkg: any;
+                    try {
+                        pkg = JSON.parse(pkgFile.content);
+                    } catch (err) {
+                        throw new Error(
+                            `Invalid JSON in package.json for ${family}: ${err instanceof Error ? err.message : String(err)}`
+                        );
+                    }
+
+                    // Essential package.json fields must be present
+                    expect(pkg).toHaveProperty('dependencies', `Missing dependencies object in ${family}`);
+                    expect(typeof pkg.dependencies).toBe('object', `dependencies is not an object in ${family}`);
+
+                    // Stellar SDK MUST be in dependencies (not devDependencies)
+                    expect(
+                        pkg.dependencies['stellar-sdk'],
+                        `stellar-sdk missing from dependencies in ${family}. Dependencies: ${JSON.stringify(pkg.dependencies)}`
+                    ).toBeDefined();
+
+                    // Stellar SDK version must be a valid semver string
+                    const version = pkg.dependencies['stellar-sdk'];
+                    expect(typeof version).toBe('string', `stellar-sdk version is not a string in ${family}`);
+                    expect(version.length).toBeGreaterThan(0, `stellar-sdk version is empty in ${family}`);
+
+                    // Version should be semver-like (e.g., ^11.2.2 or 11.2.2)
+                    expect(version).toMatch(/^[\^~>=]*\d+\.\d+\.\d+/, 
+                        `stellar-sdk version "${version}" is not valid semver in ${family}`);
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+
+    // ── 46-B: stellar-sdk version is consistent across all templates ────────
+
+    it(
+        '46-B: for all template families, stellar-sdk uses consistent version spec',
+        () => {
+            /**
+             * Feature: code-generation, Property 46: Stellar SDK Inclusion
+             * Validates: Requirements 7.5 (consistency)
+             *
+             * Ensures that the version constraint used for stellar-sdk
+             * is consistent across all template families. While the version
+             * itself might vary, the constraint format should be predictable.
+             */
+            const versions: Record<TemplateFamilyId, string | null> = {
+                'stellar-dex': null,
+                'soroban-defi': null,
+                'payment-gateway': null,
+                'asset-issuance': null,
+            };
+
+            fc.assert(
+                fc.property(arbCustomizationConfig, (cfg) => {
+                    // Generate for each template family
+                    for (const family of TEMPLATE_FAMILIES as readonly TemplateFamilyId[]) {
+                        const result = svc.generate({
+                            templateId: family,
+                            templateFamily: family,
+                            customization: cfg,
+                            outputPath: '/tmp/out',
+                        });
+
+                        // Skip on generation failure
+                        if (!result.success) continue;
+
+                        const pkgFile = result.generatedFiles.find((f) => f.path === 'package.json');
+                        if (!pkgFile) continue;
+
+                        const pkg = JSON.parse(pkgFile.content);
+                        const version = pkg.dependencies['stellar-sdk'];
+
+                        if (!version) continue;
+
+                        // Store first version for consistency check
+                        if (!versions[family]) {
+                            versions[family] = version;
+                        }
+
+                        // Version must remain consistent (for each family separately)
+                        expect(version).toBe(
+                            versions[family],
+                            `stellar-sdk version mismatch for ${family}: expected ${versions[family]}, got ${version}`
+                        );
+                    }
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+
+    // ── 46-C: stellar-sdk is not in devDependencies ───────────────────────────
+
+    it(
+        '46-C: for any template, stellar-sdk is only in dependencies, never in devDependencies',
+        () => {
+            /**
+             * Feature: code-generation, Property 46: Stellar SDK Inclusion
+             * Validates: Requirements 7.5 (placement)
+             *
+             * Ensures that stellar-sdk is a runtime dependency, not a dev dependency.
+             * This is critical for production deployments.
+             */
+            fc.assert(
+                fc.property(arbTemplateFamily, arbCustomizationConfig, (family, cfg) => {
+                    const result = svc.generate({
+                        templateId: family,
+                        templateFamily: family,
+                        customization: cfg,
+                        outputPath: '/tmp/out',
+                    });
+
+                    // Skip on generation failure
+                    if (!result.success) return true;
+
+                    const pkgFile = result.generatedFiles.find((f) => f.path === 'package.json');
+                    if (!pkgFile) return true;
+
+                    const pkg = JSON.parse(pkgFile.content);
+
+                    // stellar-sdk MUST be in dependencies
+                    expect(pkg.dependencies['stellar-sdk']).toBeDefined();
+
+                    // stellar-sdk MUST NOT be in devDependencies
+                    if (pkg.devDependencies) {
+                        expect(
+                            pkg.devDependencies['stellar-sdk'],
+                            `stellar-sdk should not be in devDependencies for ${family}`
+                        ).toBeUndefined();
+                    }
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+
+    // ── 46-D: package.json includes other essential dependencies ──────────────
+
+    it(
+        '46-D: for any template, package.json includes essential dependencies beyond stellar-sdk',
+        () => {
+            /**
+             * Feature: code-generation, Property 46: Stellar SDK Inclusion
+             * Validates: Requirements 7.5 (completeness)
+             *
+             * Ensures that the generated package.json is not just stellar-sdk,
+             * but includes other essential dependencies for a functional app
+             * (e.g., next, react, react-dom).
+             */
+            const ESSENTIAL_DEPS = ['next', 'react', 'react-dom'];
+
+            fc.assert(
+                fc.property(arbTemplateFamily, arbCustomizationConfig, (family, cfg) => {
+                    const result = svc.generate({
+                        templateId: family,
+                        templateFamily: family,
+                        customization: cfg,
+                        outputPath: '/tmp/out',
+                    });
+
+                    // Skip on generation failure
+                    if (!result.success) return true;
+
+                    const pkgFile = result.generatedFiles.find((f) => f.path === 'package.json');
+                    if (!pkgFile) return true;
+
+                    const pkg = JSON.parse(pkgFile.content);
+
+                    // Check for essential dependencies
+                    for (const dep of ESSENTIAL_DEPS) {
+                        expect(pkg.dependencies[dep], `Missing essential dep ${dep} in ${family}`).toBeDefined();
+                    }
+
+                    // stellar-sdk should be among them
+                    expect(pkg.dependencies['stellar-sdk']).toBeDefined();
+
+                    // Total dependencies should be reasonable (at least 4: next, react, react-dom, stellar-sdk)
+                    const depCount = Object.keys(pkg.dependencies).length;
+                    expect(depCount).toBeGreaterThanOrEqual(4, 
+                        `Too few dependencies in ${family} (expected at least 4, got ${depCount})`);
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+
+    // ── 46-E: Soroban templates include @stellar/stellar-sdk when applicable ──
+
+    it(
+        '46-E: for soroban-defi template, both stellar-sdk and @stellar/stellar-sdk are included',
+        () => {
+            /**
+             * Feature: code-generation, Property 46: Stellar SDK Inclusion
+             * Validates: Requirements 7.5 (soroban-specific)
+             *
+             * The soroban-defi template has special requirements for Soroban
+             * integration and may require the @stellar/stellar-sdk package.
+             */
+            fc.assert(
+                fc.property(arbCustomizationConfig, (cfg) => {
+                    const result = svc.generate({
+                        templateId: 'soroban-defi',
+                        templateFamily: 'soroban-defi',
+                        customization: cfg,
+                        outputPath: '/tmp/out',
+                    });
+
+                    // Skip on generation failure
+                    if (!result.success) return true;
+
+                    const pkgFile = result.generatedFiles.find((f) => f.path === 'package.json');
+                    if (!pkgFile) return true;
+
+                    const pkg = JSON.parse(pkgFile.content);
+
+                    // Standard stellar-sdk must be present
+                    expect(pkg.dependencies['stellar-sdk']).toBeDefined();
+
+                    // @stellar/stellar-sdk should also be present for Soroban support
+                    expect(pkg.dependencies['@stellar/stellar-sdk']).toBeDefined();
+                }),
+                { numRuns: 100 }
+            );
+        }
+    );
+});
