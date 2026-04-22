@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/api/schema/stryker-core.json",
+  "mutate": [
+    "apps/backend/src/services/auth.service.ts",
+    "apps/backend/src/services/payment.service.ts",
+    "apps/backend/src/services/deployment-pipeline.service.ts"
+  ],
+  "testRunner": "vitest",
+  "testPathPattern": [
+    "apps/backend/src/services/auth.service.test.ts",
+    "apps/backend/src/services/auth.integration.test.ts",
+    "apps/backend/src/services/payment.service.test.ts",
+    "apps/backend/src/services/deployment-pipeline.service.test.ts"
+  ],
+  "reporters": [
+    "progress-append-only",
+    "clear-text",
+    "html",
+    "json"
+  ],
+  "htmlReporter": {
+    "baseDir": "./mutation-test-results"
+  },
+  "jsonReporter": {
+    "fileName": "./mutation-test-results/mutation.json"
+  },
+  "thresholds": {
+    "high": 80,
+    "medium": 70,
+    "low": 60
+  },
+  "timeoutMS": 5000,
+  "timeoutFactor": 1.25,
+  "maxConcurrentTestRunners": 4,
+  "logLevel": "info",
+  "plugins": [
+    "@stryker-mutator/typescript-checker"
+  ],
+  "mutator": {
+    "excludedMutations": [
+      "LogicalOperator"
+    ]
+  },
+  "disableBail": false,
+  "cleanTempDir": true,
+  "allowConsoleColors": true,
+  "dryRun": false,
+  "force": false,
+  "incremental": false,
+  "incrementalFile": ".stryker-incremental.json"
+}
